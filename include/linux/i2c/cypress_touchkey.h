@@ -26,8 +26,14 @@ extern struct class *sec_class;
 #include <linux/leds.h>
 #endif
 #include <linux/input.h>
+#ifdef CONFIG_HAS_EARLYSUSPEND
 #include <linux/earlysuspend.h>
+#endif
 #include <linux/mutex.h>
+
+#ifdef CONFIG_POWERSUSPEND
+#include <linux/powersuspend.h>
+#endif
 
 #define CONFIG_GLOVE_TOUCH
 #if defined(CONFIG_GLOVE_TOUCH)
@@ -85,7 +91,12 @@ struct cypress_touchkey_info {
 	struct i2c_client			*client;
 	struct cypress_touchkey_platform_data	*pdata;
 	struct input_dev			*input_dev;
+#ifdef CONFIG_HAS_EARLYSUSPEND
 	struct early_suspend			early_suspend;
+#endif
+#ifdef CONFIG_POWERSUSPEND
+	struct power_suspend			power_suspend;
+#endif
 	char			phys[32];
 	unsigned char			keycode[NUM_OF_KEY];
 	u8			sensitivity[NUM_OF_KEY];

@@ -22,6 +22,10 @@
 #include <linux/earlysuspend.h>
 #endif
 
+#ifdef CONFIG_POWERSUSPEND
+#include <linux/powersuspend.h>
+#endif
+
 /*#define dev_dbg(dev, fmt, arg...) dev_info(dev, fmt, ##arg)*/
 
 #define SYNAPTICS_DEVICE_NAME	"GT-I95XX"
@@ -61,7 +65,7 @@
  */
 #define SURFACE_TOUCH
 
-#define	USE_OPEN_CLOSE
+#undef	USE_OPEN_CLOSE
 #ifdef USE_OPEN_CLOSE
 /*#define USE_OPEN_DWORK*/
 #endif
@@ -319,6 +323,9 @@ struct synaptics_rmi4_data {
 	struct timer_list f51_finger_timer;
 #ifdef CONFIG_HAS_EARLYSUSPEND
 	struct early_suspend early_suspend;
+#endif
+#ifdef CONFIG_POWERSUSPEND
+	struct power_suspend power_suspend;
 #endif
 	unsigned char *firmware_image;
 
