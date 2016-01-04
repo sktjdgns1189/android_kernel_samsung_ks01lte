@@ -33,6 +33,10 @@
 
 #include "boot_stats.h"
 
+#ifdef CONFIG_SEC_PM
+#include <linux/io.h>
+#endif
+
 #define BUILD_ID_LENGTH 32
 #define SMEM_IMAGE_VERSION_BLOCKS_COUNT 32
 #define SMEM_IMAGE_VERSION_SINGLE_BLOCK_SIZE 128
@@ -564,6 +568,58 @@ static uint32_t socinfo_get_format(void)
 	return socinfo ? socinfo->v1.format : 0;
 }
 
+#ifdef CONFIG_SEC_PM
+#define QFPROM_RAW_PTE_ROW1_LSB 0xFC4B80B0
+
+static uint32_t socinfo_get_pvs(void)
+{
+	u32 pte_efuse, redundant_sel, pvs_valid;
+	uint32_t pvs_bin;
+	void __iomem *pte_efuse_base;
+
+	pte_efuse_base = ioremap(QFPROM_RAW_PTE_ROW1_LSB, 8);
+
+	pte_efuse = readl_relaxed(pte_efuse_base);
+	redundant_sel = (pte_efuse >> 24) & 0x7;
+	pvs_bin = ((pte_efuse >> 28) & 0x8) | ((pte_efuse >> 6) & 0x7);
+
+	switch (redundant_sel) {
+	case 2:
+		pvs_bin = (pte_efuse >> 27) & 0xF;
+		break;
+	}
+
+	/* Check PVS_BLOW_STATUS */
+	pte_efuse = readl_relaxed(pte_efuse_base + 0x4);
+	iounmap(pte_efuse_base);
+
+	pvs_valid = !!(pte_efuse & BIT(21));
+
+	if (!pvs_valid) {
+		pr_err("%s: PVS bin is invalid %d\n", __func__, pvs_bin);
+		pvs_bin = 0;
+	}
+
+	return pvs_bin;
+}
+
+static uint32_t socinfo_get_iddq(void)
+{
+	uint32_t pte_efuse, qfprom_iddq_val;
+	void __iomem *pte_efuse_base;
+
+	pte_efuse_base = ioremap(QFPROM_RAW_PTE_ROW1_LSB, 8);
+
+	pte_efuse = readl_relaxed(pte_efuse_base);
+	iounmap(pte_efuse_base);
+
+	qfprom_iddq_val = pte_efuse & 0x7F800;
+	qfprom_iddq_val = qfprom_iddq_val >> 11;
+
+	return qfprom_iddq_val;
+}
+#endif
+
 enum msm_cpu socinfo_get_msm_cpu(void)
 {
 	return cur_cpu;
@@ -613,6 +669,34 @@ socinfo_show_build_id(struct sys_device *dev,
 
 	return snprintf(buf, PAGE_SIZE, "%-.32s\n", socinfo_get_build_id());
 }
+
+#ifdef CONFIG_SEC_PM
+static ssize_t
+socinfo_show_soc_iddq(struct sys_device *dev,
+		      struct sysdev_attribute *attr,
+		      char *buf)
+{
+	if (!socinfo) {
+		pr_err("%s: No socinfo found!\n", __func__);
+		return 0;
+	}
+
+	return snprintf(buf, PAGE_SIZE, "%d\n", socinfo_get_iddq());
+}
+
+static ssize_t
+socinfo_show_soc_pvs(struct sys_device *dev,
+		      struct sysdev_attribute *attr,
+		      char *buf)
+{
+	if (!socinfo) {
+		pr_err("%s: No socinfo found!\n", __func__);
+		return 0;
+	}
+
+	return snprintf(buf, PAGE_SIZE, "%d\n", socinfo_get_pvs());
+}
+#endif
 
 static ssize_t
 socinfo_show_raw_id(struct sys_device *dev,
@@ -717,6 +801,8 @@ socinfo_show_platform_subtype(struct sys_device *dev,
 			char *buf)
 {
 	uint32_t hw_subtype;
+	WARN_ONCE(1, "Deprecated, use platform_subtype_id instead\n");
+
 	if (!socinfo) {
 		pr_err("%s: No socinfo found!\n", __func__);
 		return 0;
@@ -743,6 +829,18 @@ socinfo_show_platform_subtype(struct sys_device *dev,
 	}
 	return snprintf(buf, PAGE_SIZE, "%-.32s\n",
 		hw_platform_subtype[hw_subtype]);
+}
+
+static ssize_t
+socinfo_show_platform_subtype_id(struct sys_device *dev,
+			struct sysdev_attribute *attr,
+			char *buf)
+{
+	uint32_t hw_subtype;
+
+	hw_subtype = socinfo_get_platform_subtype();
+	return snprintf(buf, PAGE_SIZE, "%u\n",
+		hw_subtype);
 }
 
 static ssize_t
@@ -865,6 +963,17 @@ msm_get_platform_subtype(struct device *dev,
 
 	return snprintf(buf, PAGE_SIZE, "%-.32s\n",
 		hw_platform_subtype[hw_subtype]);
+}
+
+static ssize_t
+msm_get_platform_subtype_id(struct device *dev,
+			struct device_attribute *attr,
+			char *buf)
+{
+	uint32_t hw_subtype;
+	hw_subtype = socinfo_get_platform_subtype();
+	return snprintf(buf, PAGE_SIZE, "%u\n",
+		hw_subtype);
 }
 
 static ssize_t
@@ -998,6 +1107,10 @@ static struct sysdev_attribute socinfo_v1_files[] = {
 	_SYSDEV_ATTR(id, 0444, socinfo_show_id, NULL),
 	_SYSDEV_ATTR(version, 0444, socinfo_show_version, NULL),
 	_SYSDEV_ATTR(build_id, 0444, socinfo_show_build_id, NULL),
+#ifdef CONFIG_SEC_PM
+	_SYSDEV_ATTR(soc_iddq, 0444, socinfo_show_soc_iddq, NULL),
+	_SYSDEV_ATTR(soc_pvs, 0444, socinfo_show_soc_pvs, NULL),
+#endif
 };
 
 static struct sysdev_attribute socinfo_v2_files[] = {
@@ -1022,6 +1135,8 @@ static struct sysdev_attribute socinfo_v5_files[] = {
 static struct sysdev_attribute socinfo_v6_files[] = {
 	_SYSDEV_ATTR(platform_subtype, 0444,
 			socinfo_show_platform_subtype, NULL),
+	_SYSDEV_ATTR(platform_subtype_id, 0444,
+			socinfo_show_platform_subtype_id, NULL),
 };
 
 static struct sysdev_attribute socinfo_v7_files[] = {
@@ -1106,6 +1221,13 @@ static struct device_attribute msm_soc_attr_accessory_chip =
 static struct device_attribute msm_soc_attr_platform_subtype =
 	__ATTR(platform_subtype, S_IRUGO,
 			msm_get_platform_subtype, NULL);
+
+/* Platform Subtype String is being deprecated. Use Platform
+ * Subtype ID instead.
+ */
+static struct device_attribute msm_soc_attr_platform_subtype_id =
+	__ATTR(platform_subtype_id, S_IRUGO,
+			msm_get_platform_subtype_id, NULL);
 
 static struct device_attribute msm_soc_attr_foundry_id =
 	__ATTR(foundry_id, S_IRUGO,
@@ -1207,6 +1329,8 @@ static void __init populate_soc_sysfs_files(struct device *msm_soc_device)
 	case 6:
 		device_create_file(msm_soc_device,
 					&msm_soc_attr_platform_subtype);
+		device_create_file(msm_soc_device,
+					&msm_soc_attr_platform_subtype_id);
 	case 5:
 		device_create_file(msm_soc_device,
 					&msm_soc_attr_accessory_chip);

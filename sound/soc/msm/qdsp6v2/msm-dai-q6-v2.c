@@ -1206,6 +1206,7 @@ static int __devinit msm_auxpcm_dev_probe(struct platform_device *pdev)
 	return rc;
 
 fail_reg_dai:
+	mutex_destroy(&dai_data->rlock);
 fail_invalid_intf:
 fail_nodev_intf:
 fail_invalid_dt:
@@ -1440,9 +1441,6 @@ static int msm_mi2s_get_port_id(u32 mi2s_id, int stream, u16 *port_id)
 			break;
 		case MSM_QUAT_MI2S:
 			*port_id = AFE_PORT_ID_QUATERNARY_MI2S_RX;
-			break;
-		case MSM_SEC_MI2S_VIBRA:
-			*port_id = AFE_PORT_ID_SECONDARY_MI2S_RX_VIBRA;
 			break;
 		break;
 		default:
@@ -1921,7 +1919,7 @@ static __devinit int msm_dai_q6_mi2s_dev_probe(struct platform_device *pdev)
 	dev_dbg(&pdev->dev, "dev name %s dev id %x\n", dev_name(&pdev->dev),
 		mi2s_intf);
 
-	if (mi2s_intf < MSM_PRIM_MI2S || mi2s_intf > MSM_SEC_MI2S_VIBRA) {
+	if (mi2s_intf < MSM_PRIM_MI2S || mi2s_intf > MSM_QUAT_MI2S) {
 		dev_err(&pdev->dev,
 			"%s: Invalid MI2S ID %u from Device Tree\n",
 			__func__, mi2s_intf);

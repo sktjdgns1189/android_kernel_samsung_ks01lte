@@ -33,6 +33,9 @@
 #define SLIM_ROOT_FREQ	24576000
 #define LADDR_RETRY	5
 
+#ifdef CONFIG_SND_SOC_ES325_SLIM
+#define PREVENT_SLIMBUS_SLEEP_IN_FW_DL
+#endif
 #define NGD_BASE_V1(r)	(((r) % 2) ? 0x800 : 0xA00)
 #define NGD_BASE_V2(r)	(((r) % 2) ? 0x1000 : 0x2000)
 #define NGD_BASE(r, v) ((v) ? NGD_BASE_V2(r) : NGD_BASE_V1(r))
@@ -81,8 +84,21 @@ enum ngd_status {
 	NGD_LADDR		= 1 << 1,
 };
 
+extern unsigned int system_rev;
 static int ngd_slim_runtime_resume(struct device *device);
 static int ngd_slim_power_up(struct msm_slim_ctrl *dev, bool mdm_restart);
+#if defined(PREVENT_SLIMBUS_SLEEP_IN_FW_DL)
+static int es325_slim_write_flag = 0;
+void msm_slim_es325_write_flag_set(int flag)
+{
+	pr_info("%s():es325_slim_write_flag = %d\n", __func__, flag);
+	if(es325_slim_write_flag != flag) {
+		es325_slim_write_flag = flag;
+		pr_info("%s():es325_slim_write_flag = %d\n", __func__, es325_slim_write_flag);
+	}
+}
+EXPORT_SYMBOL(msm_slim_es325_write_flag_set);
+#endif
 
 static irqreturn_t ngd_slim_interrupt(int irq, void *d)
 {
@@ -375,7 +391,7 @@ static int ngd_xfer_msg(struct slim_controller *ctrl, struct slim_msg_txn *txn)
 	mutex_lock(&dev->tx_lock);
 
 	if (report_sat == false && dev->state != MSM_CTRL_AWAKE) {
-		dev_err(dev->dev, "controller not ready");
+		SLIM_ERR(dev, "controller not ready\n");
 		mutex_unlock(&dev->tx_lock);
 		pm_runtime_set_suspended(dev->dev);
 		msm_slim_put_ctrl(dev);
@@ -1154,11 +1170,18 @@ static int ngd_notify_slaves(void *data)
 	struct slim_device *sbdev;
 	struct list_head *pos, *next;
 	int ret, i = 0;
+	ret = qmi_svc_event_notifier_register(SLIMBUS_QMI_SVC_ID,
+				SLIMBUS_QMI_SVC_V1,
+				SLIMBUS_QMI_INS_ID, &dev->qmi.nb);
+	if (ret) {
+		pr_err("Slimbus QMI service registration failed:%d", ret);
+		return ret;
+	}
+
 	while (!kthread_should_stop()) {
 		set_current_state(TASK_INTERRUPTIBLE);
 		wait_for_completion(&dev->qmi.slave_notify);
 		/* Probe devices for first notification */
-
 		if (!i) {
 			i++;
 			dev->err = 0;
@@ -1182,6 +1205,17 @@ static int ngd_notify_slaves(void *data)
 				ret = slim_get_logical_addr(sbdev,
 						sbdev->e_addr,
 						6, &sbdev->laddr);
+#if defined(CONFIG_MACH_KLTE_TMO)
+				if (system_rev == 0xd) {
+					pr_info("%s : system rev = %d\n", __func__, system_rev);
+					if ((ret == -ENXIO) &&
+						((sbdev->e_addr[4] == 0xbe) && (sbdev->e_addr[2] == 0x83))) {
+						pr_info("%s : es704 fail to assign retry to assign the es705\n", __func__);
+						sbdev->e_addr[2] = 0x03;
+						ret = slim_get_logical_addr(sbdev, sbdev->e_addr, 6, &sbdev->laddr);		
+					}
+				}
+#endif
 				if (!ret)
 					break;
 				else /* time for ADSP to assign LA */
@@ -1294,7 +1328,7 @@ static int __devinit ngd_slim_probe(struct platform_device *pdev)
 
 	/* Create IPC log context */
 	dev->ipc_slimbus_log = ipc_log_context_create(IPC_SLIMBUS_LOG_PAGES,
-						dev_name(dev->dev));
+						dev_name(dev->dev), 0);
 	if (!dev->ipc_slimbus_log)
 		dev_err(&pdev->dev, "error creating ipc_logging context\n");
 	else {
@@ -1427,14 +1461,6 @@ static int __devinit ngd_slim_probe(struct platform_device *pdev)
 	INIT_WORK(&dev->qmi.ssr_up, ngd_adsp_up);
 	dev->qmi.nb.notifier_call = ngd_qmi_available;
 	pm_runtime_get_noresume(dev->dev);
-	ret = qmi_svc_event_notifier_register(SLIMBUS_QMI_SVC_ID,
-				SLIMBUS_QMI_SVC_V1,
-				SLIMBUS_QMI_INS_ID, &dev->qmi.nb);
-	if (ret) {
-		pr_err("Slimbus QMI service registration failed:%d", ret);
-		goto qmi_register_failed;
-	}
-
 
 	/* Fire up the Rx message queue thread */
 	dev->rx_msgq_thread = kthread_run(ngd_slim_rx_msgq_thread, dev,
@@ -1459,10 +1485,6 @@ static int __devinit ngd_slim_probe(struct platform_device *pdev)
 err_notify_thread_create_failed:
 	kthread_stop(dev->rx_msgq_thread);
 err_rx_thread_create_failed:
-	qmi_svc_event_notifier_unregister(SLIMBUS_QMI_SVC_ID,
-				SLIMBUS_QMI_SVC_V1,
-				SLIMBUS_QMI_INS_ID, &dev->qmi.nb);
-qmi_register_failed:
 	free_irq(dev->irq, dev);
 err_request_irq_failed:
 	slim_del_controller(&dev->ctrl);
@@ -1500,6 +1522,22 @@ static int __devexit ngd_slim_remove(struct platform_device *pdev)
 	return 0;
 }
 
+#if defined(PREVENT_SLIMBUS_SLEEP_IN_FW_DL)
+#ifdef CONFIG_PM_RUNTIME
+static int ngd_slim_runtime_idle(struct device *device)
+{
+	struct platform_device *pdev = to_platform_device(device);
+	struct msm_slim_ctrl *dev = platform_get_drvdata(pdev);
+	if (dev->state == MSM_CTRL_AWAKE && es325_slim_write_flag == 0)
+		dev->state = MSM_CTRL_IDLE;
+	dev_dbg(device, "pm_runtime: idle...\n");
+	if ( dev->state == MSM_CTRL_IDLE && es325_slim_write_flag == 0){
+		pm_request_autosuspend(device);
+	}
+	return -EAGAIN;
+}
+#endif
+#else
 #ifdef CONFIG_PM_RUNTIME
 static int ngd_slim_runtime_idle(struct device *device)
 {
@@ -1511,6 +1549,7 @@ static int ngd_slim_runtime_idle(struct device *device)
 	pm_request_autosuspend(device);
 	return -EAGAIN;
 }
+#endif
 #endif
 
 /*

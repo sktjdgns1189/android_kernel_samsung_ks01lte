@@ -23,6 +23,9 @@
 #include <media/msm_media_info.h>
 
 #include <mach/iommu_domains.h>
+#ifdef CONFIG_SEC_KS01_PROJECT
+#include <mach/scm.h>
+#endif
 
 #include "mdss_fb.h"
 #include "mdss_mdp.h"
@@ -126,10 +129,15 @@ static inline void mdss_mdp_intr_done(int index)
 irqreturn_t mdss_mdp_isr(int irq, void *ptr)
 {
 	struct mdss_data_type *mdata = ptr;
-	u32 isr, mask, hist_isr, hist_mask;
+	u32 isr, hist_isr, hist_mask;
+	u32 mask = 0;
 
 
 	isr = MDSS_MDP_REG_READ(MDSS_MDP_REG_INTR_STATUS);
+
+#if 0//defined (CONFIG_FB_MSM_MDSS_DSI_DBG)
+	xlog(__func__, 0, isr, mask, 0, 0, 0);
+#endif
 
 	if (isr == 0)
 		goto mdp_isr_done;
@@ -320,7 +328,7 @@ int mdss_mdp_get_rau_strides(u32 w, u32 h,
 }
 
 int mdss_mdp_get_plane_sizes(u32 format, u32 w, u32 h,
-			     struct mdss_mdp_plane_sizes *ps, u32 bwc_mode)
+	struct mdss_mdp_plane_sizes *ps, u32 bwc_mode, bool rotation)
 {
 	struct mdss_mdp_format_params *fmt;
 	int i, rc;
@@ -374,9 +382,19 @@ int mdss_mdp_get_plane_sizes(u32 format, u32 w, u32 h,
 			u8 hmap[] = { 1, 2, 1, 2 };
 			u8 vmap[] = { 1, 1, 2, 2 };
 			u8 horiz, vert, stride_align, height_align;
+			u32 chroma_samp;
 
-			horiz = hmap[fmt->chroma_sample];
-			vert = vmap[fmt->chroma_sample];
+			chroma_samp = fmt->chroma_sample;
+
+			if (rotation) {
+				if (chroma_samp == MDSS_MDP_CHROMA_H2V1)
+					chroma_samp = MDSS_MDP_CHROMA_H1V2;
+				else if (chroma_samp == MDSS_MDP_CHROMA_H1V2)
+					chroma_samp = MDSS_MDP_CHROMA_H2V1;
+			}
+
+			horiz = hmap[chroma_samp];
+			vert = vmap[chroma_samp];
 
 			switch (format) {
 			case MDP_Y_CR_CB_GH2V2:
@@ -476,6 +494,70 @@ void mdss_mdp_data_calc_offset(struct mdss_mdp_data *data, u16 x, u16 y,
 	}
 }
 
+#ifdef CONFIG_SEC_KS01_PROJECT
+#define SCM_CP_MDSS_SECURE 0xF
+
+extern void mdss_mdp_rotator_wait4idle(void);
+
+static int __mdss_mdp_set_secure(struct mdss_data_type *mdata, int enable)
+{
+	u32 cmd, resp = 0;
+	int rc;
+
+	mutex_lock(&mdata->sec_lock);
+	pr_debug("MDP Secure Mode=%d\n", enable);
+
+	cmd = enable ? 1 : 0;
+	if (mdata->secure_mode == cmd) {
+		mutex_unlock(&mdata->sec_lock);
+		return 0;
+	}
+
+	mdata->secure_mode = cmd;
+	if (mdata->secure_mode)
+		mdss_mdp_rotator_wait4idle();
+
+	rc = scm_call(SCM_SVC_MP, SCM_CP_MDSS_SECURE,
+			&cmd, sizeof(cmd), &resp, sizeof(resp));
+	if (resp)
+		rc = resp;
+	mutex_unlock(&mdata->sec_lock);
+
+	return rc;
+}
+
+static void __mdss_mdp_end_secure(struct kref *kref)
+{
+	struct mdss_data_type *mdata;
+	int rc;
+
+	mdata = container_of(kref, struct mdss_data_type, sec_kref);
+
+	rc = __mdss_mdp_set_secure(mdata, 0);
+	WARN(rc, "Unsecure MDSS failed=%d\n", rc);
+}
+
+void mdss_mdp_secure_vote(int enable)
+{
+	struct mdss_data_type *mdata = mdss_mdp_get_mdata();
+	int rc;
+
+	if (enable) {
+		if (!mdata->secure_mode) {
+			kref_init(&mdata->sec_kref);
+
+			rc = __mdss_mdp_set_secure(mdata, 1);
+			WARN(rc, "Secure MDSS failed=%d\n", rc);
+		} else {
+			kref_get(&mdss_res->sec_kref);
+		}
+	} else {
+		WARN(!mdata->secure_mode, "Unbalanced secure mode ref count\n");
+		kref_put(&mdata->sec_kref, __mdss_mdp_end_secure);
+	}
+}
+#endif
+
 int mdss_mdp_put_img(struct mdss_mdp_img_data *data)
 {
 	struct ion_client *iclient = mdss_get_ionclient();
@@ -488,24 +570,31 @@ int mdss_mdp_put_img(struct mdss_mdp_img_data *data)
 		data->srcp_file = NULL;
 	} else if (!IS_ERR_OR_NULL(data->srcp_ihdl)) {
 		pr_debug("ion hdl=%p buf=0x%x\n", data->srcp_ihdl, data->addr);
-
-		if (is_mdss_iommu_attached()) {
-			int domain;
-			if (data->flags & MDP_SECURE_OVERLAY_SESSION)
-				domain = MDSS_IOMMU_DOMAIN_SECURE;
-			else
-				domain = MDSS_IOMMU_DOMAIN_UNSECURE;
-			ion_unmap_iommu(iclient, data->srcp_ihdl,
+		if (!iclient) {
+			pr_err("invalid ion client\n");
+			return -ENOMEM;
+		} else {
+			if (is_mdss_iommu_attached()) {
+				int domain;
+				if (data->flags & MDP_SECURE_OVERLAY_SESSION)
+					domain = MDSS_IOMMU_DOMAIN_SECURE;
+				else
+					domain = MDSS_IOMMU_DOMAIN_UNSECURE;
+				ion_unmap_iommu(iclient, data->srcp_ihdl,
 					mdss_get_iommu_domain(domain), 0);
 
-			if (domain == MDSS_IOMMU_DOMAIN_SECURE) {
-				msm_ion_unsecure_buffer(iclient,
-					data->srcp_ihdl);
+				if (domain == MDSS_IOMMU_DOMAIN_SECURE) {
+					msm_ion_unsecure_buffer(iclient,
+							data->srcp_ihdl);
+#ifdef CONFIG_SEC_KS01_PROJECT
+					mdss_mdp_secure_vote(0);
+#endif
+				}
 			}
+			ion_free(iclient, data->srcp_ihdl);
+			data->srcp_ihdl = NULL;
 		}
 
-		ion_free(iclient, data->srcp_ihdl);
-		data->srcp_ihdl = NULL;
 	} else {
 		return -ENOMEM;
 	}
@@ -561,6 +650,9 @@ int mdss_mdp_get_img(struct msmfb_data *img, struct mdss_mdp_img_data *data)
 			int domain;
 			if (data->flags & MDP_SECURE_OVERLAY_SESSION) {
 				domain = MDSS_IOMMU_DOMAIN_SECURE;
+#ifdef CONFIG_SEC_KS01_PROJECT
+				mdss_mdp_secure_vote(1);
+#endif
 				ret = msm_ion_secure_buffer(iclient,
 					data->srcp_ihdl, 0x2, 0);
 				if (IS_ERR_VALUE(ret)) {

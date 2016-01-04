@@ -143,6 +143,13 @@ enum msm_i2c_state {
 #define QUP_OUT_FIFO_NOT_EMPTY		0x10
 #define I2C_GPIOS_DT_CNT		(2)		/* sda and scl */
 
+#if defined(CONFIG_MACH_KS01EUR) || defined(CONFIG_SEC_CHAGALL_PROJECT) 
+/* Register:QUP_I2C_MASTER_CLK_CTL field setters */
+#define QUP_I2C_SCL_NOISE_REJECTION(reg_val, noise_rej_val) \
+		(((reg_val) & ~(0x3 << 24)) | (((noise_rej_val) & 0x3) << 24))
+#define QUP_I2C_SDA_NOISE_REJECTION(reg_val, noise_rej_val) \
+		(((reg_val) & ~(0x3 << 26)) | (((noise_rej_val) & 0x3) << 26))
+#endif
 static char const * const i2c_rsrcs[] = {"i2c_clk", "i2c_sda"};
 
 static struct gpiomux_setting recovery_config = {
@@ -193,6 +200,7 @@ struct qup_i2c_dev {
 	int                          wr_sz;
 	struct msm_i2c_platform_data *pdata;
 	enum msm_i2c_state           pwr_state;
+	atomic_t		     xfer_progress;
 	struct mutex                 mlock;
 	void                         *complete;
 	int                          i2c_gpios[ARRAY_SIZE(i2c_rsrcs)];
@@ -230,8 +238,10 @@ qup_i2c_interrupt(int irq, void *devid)
 	uint32_t op_flgs = 0;
 	int err = 0;
 
-	if (pm_runtime_suspended(dev->dev))
+	if (atomic_read(&dev->xfer_progress) != 1) {
+		dev_err(dev->dev, "irq:%d when PM suspended\n", irq);
 		return IRQ_NONE;
+	}
 
 	status = readl_relaxed(dev->base + QUP_I2C_STATUS);
 	status1 = readl_relaxed(dev->base + QUP_ERROR_FLAGS);
@@ -786,7 +796,7 @@ qup_issue_write(struct qup_i2c_dev *dev, struct i2c_msg *msg, int rem,
 					(uint32_t)dev->base +
 					QUP_OUT_FIFO_BASE + (*idx), 0);
 				*idx += 2;
-			} else if (next->flags == 0 && dev->pos == msg->len - 1
+			} else if ((dev->pos == msg->len - 1)
 					&& *idx < (dev->wr_sz*2) &&
 					(next->addr != msg->addr)) {
 				/* Last byte of an intermittent write */
@@ -1002,6 +1012,7 @@ qup_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[], int num)
 	if (dev->pdata->clk_ctl_xfer)
 		i2c_qup_pm_resume_clk(dev);
 
+	atomic_set(&dev->xfer_progress, 1);
 	/* Initialize QUP registers during first transfer */
 	if (dev->clk_ctl == 0) {
 		int fs_div;
@@ -1023,6 +1034,12 @@ qup_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[], int num)
 				/ dev->pdata->clk_freq) / 2) - 3;
 		hs_div = 3;
 		dev->clk_ctl = ((hs_div & 0x7) << 8) | (fs_div & 0xff);
+#if defined(CONFIG_MACH_KS01EUR) || defined(CONFIG_SEC_CHAGALL_PROJECT)
+		dev->clk_ctl = QUP_I2C_SCL_NOISE_REJECTION(
+				dev->clk_ctl, dev->pdata->noise_rjct_scl);
+		dev->clk_ctl = QUP_I2C_SDA_NOISE_REJECTION(
+				dev->clk_ctl, dev->pdata->noise_rjct_sda);
+#endif
 		fifo_reg = readl_relaxed(dev->base + QUP_IO_MODE);
 		if (fifo_reg & 0x3)
 			dev->out_blk_sz = (fifo_reg & 0x3) * 16;
@@ -1305,6 +1322,7 @@ timeout_err:
 	dev->cnt = 0;
 	if (dev->pdata->clk_ctl_xfer)
 		i2c_qup_pm_suspend_clk(dev);
+	atomic_set(&dev->xfer_progress, 0);
 	mutex_unlock(&dev->mlock);
 	pm_runtime_mark_last_busy(dev->dev);
 	pm_runtime_put_autosuspend(dev->dev);
@@ -1346,6 +1364,10 @@ int __devinit msm_i2c_rsrcs_dt_to_pdata_map(struct platform_device *pdev,
 	{"qcom,sda-gpio",      gpios + 1,           DT_OPTIONAL,  DT_GPIO, -1},
 	{"qcom,clk-ctl-xfer", &pdata->clk_ctl_xfer, DT_OPTIONAL,  DT_BOOL, -1},
 	{"qcom,active-only",  &pdata->active_only,  DT_OPTIONAL,  DT_BOOL,  0},
+#if defined(CONFIG_MACH_KS01EUR) || defined(CONFIG_SEC_CHAGALL_PROJECT)
+	{"qcom,noise-rjct-scl", &pdata->noise_rjct_scl, DT_OPTIONAL, DT_U32, 0},
+	{"qcom,noise-rjct-sda", &pdata->noise_rjct_sda, DT_OPTIONAL, DT_U32, 0},
+#endif
 	{NULL,                 NULL,                0,            0,        0},
 	};
 
@@ -1503,7 +1525,7 @@ blsp_core_init:
 		dev_err(&pdev->dev, "Could not get iface_clk\n");
 		ret = PTR_ERR(pclk);
 		clk_put(clk);
-		goto err_clk_get_failed;
+		goto err_config_pckl_failed;
 	}
 
 	/* We support frequencies upto FAST Mode(400KHz) */
@@ -1655,6 +1677,7 @@ blsp_core_init:
 
 	mutex_init(&dev->mlock);
 	dev->pwr_state = MSM_I2C_PM_SUSPENDED;
+	atomic_set(&dev->xfer_progress, 0);
 	/* If the same AHB clock is used on Modem side
 	 * switch it on here itself and don't switch it
 	 * on and off during suspend and resume.
@@ -1697,6 +1720,7 @@ err_ioremap_failed:
 err_alloc_dev_failed:
 err_config_failed:
 	clk_put(clk);
+err_config_pckl_failed:
 	clk_put(pclk);
 err_clk_get_failed:
 	if (gsbi_mem)

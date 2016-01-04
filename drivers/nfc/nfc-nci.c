@@ -13,6 +13,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/fs.h>
+#include <linux/reboot.h>
 #include <linux/slab.h>
 #include <linux/i2c.h>
 #include <linux/irq.h>
@@ -47,7 +48,7 @@ static struct of_device_id msm_match_table[] = {
 MODULE_DEVICE_TABLE(of, msm_match_table);
 
 #define MAX_BUFFER_SIZE			(780)
-#define PACKET_MAX_LENGTH			(258)
+#define PACKET_MAX_LENGTH		(258)
 /* Read data */
 #define PACKET_HEADER_SIZE_NCI	(4)
 #define PACKET_TYPE_NCI			(16)
@@ -55,10 +56,12 @@ MODULE_DEVICE_TABLE(of, msm_match_table);
 #define MAX_QCA_REG				(116)
 /* will timeout in approx. 100ms as 10us steps */
 #define NFC_RF_CLK_FREQ			(19200000)
-#define NTF_TIMEOUT				(10000)
+#define NTF_TIMEOUT				(25)
 #define	CORE_RESET_RSP_GID		(0x60)
 #define	CORE_RESET_OID			(0x00)
-#define CORE_RST_NTF_LENGTH			(0x02)
+#define CORE_RST_NTF_LENGTH		(0x02)
+#define WAKE_TIMEOUT			(10)
+#define WAKE_REG			(0x10)
 
 static void clk_req_update(struct work_struct *work);
 
@@ -89,6 +92,7 @@ struct qca199x_dev {
 	unsigned int		clk_src_gpio;
 	const	char		*clk_src_name;
 	struct	clk		*s_clk;
+	unsigned int 		core_reset_ntf;
 	bool			clk_run;
 	struct work_struct	msm_clock_controll_work;
 	struct workqueue_struct *my_wq;
@@ -96,7 +100,8 @@ struct qca199x_dev {
 
 static int nfc_i2c_write(struct i2c_client *client, u8 *buf, int len);
 static int nfcc_hw_check(struct i2c_client *client, unsigned short curr_addr);
-static int nfcc_initialise(struct i2c_client *client, unsigned short curr_addr);
+static int nfcc_initialise(struct i2c_client *client, unsigned short curr_addr,
+				struct qca199x_dev *qca199x_dev);
 static int qca199x_clock_select(struct qca199x_dev *qca199x_dev);
 static int qca199x_clock_deselect(struct qca199x_dev *qca199x_dev);
 
@@ -114,6 +119,9 @@ static struct devicemode	device_mode;
 static int					ftm_raw_write_mode;
 static int					ftm_werr_code;
 
+
+unsigned int	disable_ctrl;
+bool		region2_sent;
 
 static void qca199x_init_stat(struct qca199x_dev *qca199x_dev)
 {
@@ -330,11 +338,11 @@ static ssize_t nfc_read(struct file *filp, char __user *buf,
 	/* Read the header */
 	ret = i2c_master_recv(qca199x_dev->client, len, PAYLOAD_HEADER_LENGTH);
 	/*
-		We ignore all packets of length PAYLOAD_HEADER_LENGTH
-		or less (i.e <=3). In this case return a total length
-		of ZERO. So ALL PACKETS MUST HAVE A PAYLOAD.
-		If ret < 0 then this is an error code.
-	*/
+	 * We ignore all packets of length PAYLOAD_HEADER_LENGTH
+	 * or less (i.e <=3). In this case return a total length
+	 * of ZERO. So ALL PACKETS MUST HAVE A PAYLOAD.
+	 * If ret < 0 then this is an error code.
+	 */
 	if (ret != PAYLOAD_HEADER_LENGTH) {
 		if (ret < 0)
 			total = ret;
@@ -358,6 +366,8 @@ static ssize_t nfc_read(struct file *filp, char __user *buf,
 			goto err;
 	}
 
+	dev_dbg(&qca199x_dev->client->dev, "%s : NfcNciRx %x %x %x\n",
+			__func__, tmp[0], tmp[1], tmp[2]);
 	if (total > 0) {
 		if ((total > count) || copy_to_user(buf, tmp, total)) {
 			dev_err(&qca199x_dev->client->dev,
@@ -373,14 +383,14 @@ done:
 }
 
 /*
-	Local routine to read from nfcc buffer. This is called to clear any
-	pending receive messages in the nfcc's read buffer, which may be there
-	following a POR. In this way, the upper layers (Device Transport) will
-	associate the next rsp/ntf nci message with the next nci command to the
-	nfcc. Otherwise, the DT may interpret a ntf from the nfcc as being from
-	the nci core reset command when in fact it was already present in the
-	nfcc read buffer following a POR.
-*/
+ * Local routine to read from nfcc buffer. This is called to clear any
+ * pending receive messages in the nfcc's read buffer, which may be there
+ * following a POR. In this way, the upper layers (Device Transport) will
+ * associate the next rsp/ntf nci message with the next nci command to the
+ * nfcc. Otherwise, the DT may interpret a ntf from the nfcc as being from
+ * the nci core reset command when in fact it was already present in the
+ * nfcc read buffer following a POR.
+ */
 
 int nfcc_read_buff_svc(struct qca199x_dev *qca199x_dev)
 {
@@ -412,6 +422,8 @@ int nfcc_read_buff_svc(struct qca199x_dev *qca199x_dev)
 			PAYLOAD_HEADER_LENGTH));
 		total = ret;
 	}
+	dev_dbg(&qca199x_dev->client->dev, "%s : NfcNciRx %x %x %x\n",
+			__func__, tmp[0], tmp[1], tmp[2]);
 leave:
 	mutex_unlock(&qca199x_dev->read_mutex);
 	return total;
@@ -436,11 +448,11 @@ static ssize_t nfc_write(struct file *filp, const char __user *buf,
 		return -EFAULT;
 	}
 	/*
-		A catch for when the DT is sending the initial NCI write
-		following a hardware POR. In this case we should clear any
-		pending messages in nfcc buffer and open the interrupt gate
-		for new messages coming from the nfcc.
-	*/
+	 * A catch for when the DT is sending the initial NCI write
+	 * following a hardware POR. In this case we should clear any
+	 * pending messages in nfcc buffer and open the interrupt gate
+	 * for new messages coming from the nfcc.
+	 */
 	if ((qca199x_dev->sent_first_nci_write == false) &&
 		 (qca199x_dev->irq_enabled == false)) {
 		/* check rsp/ntf from nfcc read-side buffer */
@@ -491,6 +503,13 @@ static ssize_t nfc_write(struct file *filp, const char __user *buf,
 	}
 	mutex_unlock(&qca199x_dev->read_mutex);
 
+	/* If we detect a Region2 command prior to power-down */
+	if ((tmp[0] == 0x2F) && (tmp[1] == 0x01) && (tmp[2] == 0x02) &&
+		(tmp[3] == 0x08) && (tmp[4] == 0x00)) {
+		region2_sent = true;
+	}
+	dev_dbg(&qca199x_dev->client->dev, "%s : NfcNciTx %x %x %x\n",
+			__func__, tmp[0], tmp[1], tmp[2]);
 	return ret;
 }
 
@@ -523,11 +542,13 @@ static int nfc_open(struct inode *inode, struct file *filp)
 int nfcc_wake(int level, struct file *filp)
 {
 	int r = 0;
+	int time_taken = 0;
 	unsigned char raw_nci_sleep[] = {0x2F, 0x03, 0x00};
 	/* Change slave address to 0xE */
 	unsigned char raw_nci_wake[]  = {0x10, 0x0F};
 	unsigned short	slave_addr	=	0xE;
 	unsigned short	curr_addr;
+	unsigned char wake_status	= WAKE_REG;
 	struct qca199x_dev *qca199x_dev = filp->private_data;
 
 	dev_dbg(&qca199x_dev->client->dev, "nfcc_wake: %s: info: %p\n",
@@ -537,7 +558,6 @@ int nfcc_wake(int level, struct file *filp)
 		r = i2c_master_send(qca199x_dev->client, &raw_nci_sleep[0],
 						sizeof(raw_nci_sleep));
 
-		r = sizeof(raw_nci_sleep);
 		if (r != sizeof(raw_nci_sleep))
 			return -EMSGSIZE;
 		qca199x_dev->state = NFCC_STATE_NORMAL_SLEEP;
@@ -546,10 +566,31 @@ int nfcc_wake(int level, struct file *filp)
 		qca199x_dev->client->addr = slave_addr;
 		r = nfc_i2c_write(qca199x_dev->client, &raw_nci_wake[0],
 						sizeof(raw_nci_wake));
+		do {
+			wake_status = WAKE_REG;
+			r = nfc_i2c_write(qca199x_dev->client, &wake_status, 1);
+			/*
+			 * NFCC chip needs to be at least
+			 * 10usec high before make it low
+			 */
+			usleep_range(10, 15);
+			r = i2c_master_recv(qca199x_dev->client, &wake_status,
+						sizeof(wake_status));
+
+			time_taken++;
+			if ((wake_status & NCI_WAKE) != 0)
+				/* NFCC wakeup time is between 0.5 and .52 ms */
+				usleep_range(500, 520);
+
+		} while ((wake_status & NCI_WAKE)
+				&& (time_taken < WAKE_TIMEOUT));
 		/* Restore original NFCC slave I2C address */
+		if (time_taken >= WAKE_TIMEOUT)
+			dev_err(&qca199x_dev->client->dev,
+			"nfc_ioctl_nfcc_version : TIMED OUT to get WAKEUP bit\n");
+
 		qca199x_dev->client->addr = curr_addr;
-		r = sizeof(raw_nci_wake);
-		if (r != sizeof(raw_nci_wake))
+		if (r != sizeof(wake_status))
 			return -EMSGSIZE;
 		qca199x_dev->state = NFCC_STATE_NORMAL_WAKE;
 	}
@@ -584,47 +625,40 @@ int nfc_ioctl_power_states(struct file *filp, unsigned int cmd,
 		r = qca199x_clock_select(qca199x_dev);
 		if (r < 0)
 			goto err_req;
+		dev_dbg(&qca199x_dev->client->dev, "gpio_set_value disable: %s: info: %p\n",
+			__func__, qca199x_dev);
 		gpio_set_value(qca199x_dev->dis_gpio, 0);
-		r = gpio_direction_output(qca199x_dev->dis_gpio, 1);
-		if (r) {
-			dev_err(&qca199x_dev->client->dev,
-					"unable to set direction for gpio [%d]\n",
-					qca199x_dev->dis_gpio);
-			goto err_req;
-		}
-		gpio_set_value(qca199x_dev->dis_gpio, 0);
-		msleep(20);
+		usleep(1000);
 	} else if (arg == 1) {
 		/*
-			We are attempting a hardware reset so let us disable
-			interrupts to avoid spurious notifications to upper
-			layers.
-		*/
+		 * We are attempting a hardware reset so let us disable
+		 * interrupts to avoid spurious notifications to upper
+		 * layers.
+		 */
 		qca199x_disable_irq(qca199x_dev);
 		/* Deselection of clock */
 		r = qca199x_clock_deselect(qca199x_dev);
 		if (r < 0)
 			goto err_req;
 		/*
-			Also, set flag for initial NCI write following resetas
-			may wish to do some house keeping. Ensure no pending
-			messages in NFCC buffers which may be wrongly
-			construed as response to initial message
-		*/
+		 * Also, set flag for initial NCI write following resetas
+		 * may wish to do some house keeping. Ensure no pending
+		 * messages in NFCC buffers which may be wrongly
+		 * construed as response to initial message
+		 */
 		qca199x_dev->sent_first_nci_write = false;
-		gpio_set_value(qca199x_dev->dis_gpio, 0);
-		r = gpio_direction_output(qca199x_dev->dis_gpio, 1);
-		if (r) {
-			dev_err(&qca199x_dev->client->dev,
-					"unable to set direction for gpio [%d]\n",
-					qca199x_dev->dis_gpio);
-			goto err_req;
-		}
+		dev_dbg(&qca199x_dev->client->dev, "gpio_set_value enable: %s: info: %p\n",
+			__func__, qca199x_dev);
 		gpio_set_value(qca199x_dev->dis_gpio, 1);
-		usleep(1000);
+		/*nfcc needs atleast 100ms for the chip to power cycle*/
+		msleep(100);
 	} else if (arg == 2) {
 		mutex_lock(&qca199x_dev->read_mutex);
-		r = nfcc_initialise(qca199x_dev->client, 0xE);
+		dev_dbg(&qca199x_dev->client->dev, "before nfcc_initialise: %s: info: %p\n",
+			__func__, qca199x_dev);
+		r = nfcc_initialise(qca199x_dev->client, 0xE, qca199x_dev);
+		dev_dbg(&qca199x_dev->client->dev, "after nfcc_initialise: %s: info: %p\n",
+			__func__, qca199x_dev);
 		/* Also reset first NCI write */
 		qca199x_dev->sent_first_nci_write = false;
 		mutex_unlock(&qca199x_dev->read_mutex);
@@ -638,6 +672,8 @@ int nfc_ioctl_power_states(struct file *filp, unsigned int cmd,
 	} else if (arg == 4) {
 		mutex_lock(&qca199x_dev->read_mutex);
 		nfcc_wake(NFCC_WAKE, filp);
+		dev_dbg(&qca199x_dev->client->dev, "nfcc wake: %s: info: %p\n",
+			__func__, qca199x_dev);
 		mutex_unlock(&qca199x_dev->read_mutex);
 	} else if (arg == 5) {
 		nfcc_wake(NFCC_SLEEP, filp);
@@ -716,9 +752,11 @@ int nfc_ioctl_nfcc_version(struct file *filp, unsigned int cmd,
 				unsigned long arg)
 {
 	int r = 0;
+	int	time_taken	= 0;
 	unsigned short	slave_addr	=	0xE;
 	unsigned short	curr_addr;
 	unsigned char	raw_nci_wake[]			= {0x10, 0x0F};
+	unsigned char	raw_nci_read;
 	unsigned char raw_chip_version_addr		= 0x00;
 	unsigned char raw_chip_rev_id_addr		= 0x9C;
 	unsigned char raw_chip_version			= 0xFF;
@@ -736,39 +774,86 @@ int nfc_ioctl_nfcc_version(struct file *filp, unsigned int cmd,
 	qca199x_dev->client->addr = slave_addr;
 	r = nfc_i2c_write(qca199x_dev->client, &raw_nci_wake[0],
 						sizeof(raw_nci_wake));
-	r = sizeof(raw_nci_wake);
-	if (r != sizeof(raw_nci_wake))
-		goto invalid_wake_up;
-	qca199x_dev->state = NFCC_STATE_NORMAL_WAKE;
 
-	/* sleep to ensure the NFCC has time to wake up */
-	usleep(100);
+	if (r != sizeof(raw_nci_wake))
+		dev_err(&qca199x_dev->client->dev,
+		"nfc_ioctl_nfcc_version : failed to send wake command\n");
+
+	/*
+	 * After placing the NFCC to sleep by a PROP
+	 * SLEEP NCI msg (2F 03) and we need to wake
+	 * it back up to obtain some information (by
+	 * setting the wake bit).We need to determine
+	 * when it has in actual fact woken before we
+	 * can read the required data. We do that by
+	 * reading back & testing if that wake bit has
+	 * been cleared.
+	 */
+	do {
+		raw_nci_read = 0x10;
+		r = nfc_i2c_write(qca199x_dev->client, &raw_nci_read, 1);
+		/*
+		 * NFCC chip needs to be at least
+		 * 10usec high before make it low
+		 */
+		usleep_range(10, 15);
+
+		r = i2c_master_recv(qca199x_dev->client, &raw_nci_read,
+						sizeof(raw_nci_read));
+
+		if ((raw_nci_read & NCI_WAKE) != 0)
+			/* NFCC wakeup time is between 0.5 and .52 ms */
+			usleep_range(500, 520);
+
+		time_taken++;
+
+	} while ((raw_nci_read & NCI_WAKE)
+			&& (time_taken < WAKE_TIMEOUT));
+
+	if (time_taken < WAKE_TIMEOUT)
+		qca199x_dev->state = NFCC_STATE_NORMAL_WAKE;
+	else
+		dev_err(&qca199x_dev->client->dev,
+		"nfc_ioctl_nfcc_version : TIMED OUT to get WAKEUP bit\n");
+
+
+	if (r != 1) {
+		/*
+		 * r < 0 indicates an error, maybe chip isn't
+		 * up yet.What should we do??? r = 0 indicates
+		 * nothing read, maybe chip isn't up yet. (should
+		 * not happen) r > 1 indicates too many bytes read,
+		 * maybe ?(should not happen)
+		 */
+		dev_err(&qca199x_dev->client->dev,
+		"nfc_ioctl_nfcc_version : i2c error %d\n", r);
+	}
+
 	if (arg == 0) {
 		r = nfc_i2c_write(qca199x_dev->client,
 				&raw_chip_version_addr, 1);
-		if (r < 0)
-			goto invalid_wr;
-		usleep(10);
-		r = i2c_master_recv(qca199x_dev->client, &raw_chip_version, 1);
-		/* Restore original NFCC slave I2C address */
-		qca199x_dev->client->addr = curr_addr;
 	} else if (arg == 1) {
 		r = nfc_i2c_write(qca199x_dev->client,
 				&raw_chip_rev_id_addr, 1);
-		if (r < 0)
-			goto invalid_wr;
-		usleep(20);
-		r = i2c_master_recv(qca199x_dev->client, &raw_chip_version, 1);
+	} else {
 		/* Restore original NFCC slave I2C address */
 		qca199x_dev->client->addr = curr_addr;
+		return -EINVAL;
 	}
-	return raw_chip_version;
-invalid_wake_up:
-	raw_chip_version = 0xFE;
-invalid_wr:
-	raw_chip_version = 0xFF;
-	dev_err(&qca199x_dev->client->dev,
-			"\nNFCC_INVALID_CHIP_VERSION = %d\n", raw_chip_version);
+
+	if (r < 0) {
+		/* Restore original NFCC slave I2C address */
+		qca199x_dev->client->addr = curr_addr;
+		dev_err(&qca199x_dev->client->dev,
+			"NFCC_INVALID_CHIP_VERSION : i2c write fail\n");
+		return -EIO;
+	}
+
+	usleep(10);
+	r = i2c_master_recv(qca199x_dev->client, &raw_chip_version, 1);
+
+	/* Restore original NFCC slave I2C address */
+	qca199x_dev->client->addr = curr_addr;
 	return raw_chip_version;
 }
 
@@ -806,6 +891,26 @@ int nfc_ioctl_kernel_logging(unsigned long arg,  struct file *filp)
 	return retval;
 }
 
+/*
+ * Inside nfc_ioctl_core_reset_ntf
+ *
+ * @brief   nfc_ioctl_core_reset_ntf
+ *
+ * Allows callers to determine if a CORE_RESET_NTF has arrived
+ *
+ * Returns the value of variable core_reset_ntf
+ *
+ */
+int nfc_ioctl_core_reset_ntf(struct file *filp, unsigned int cmd,
+				unsigned long arg)
+{
+	struct qca199x_dev *qca199x_dev = filp->private_data;
+	dev_dbg(&qca199x_dev->client->dev,
+		"nfc_ioctl_core_reset_ntf: returning = %d\n",
+		qca199x_dev->core_reset_ntf);
+	return qca199x_dev->core_reset_ntf;
+}
+
 static long nfc_ioctl(struct file *pfile, unsigned int cmd, unsigned long arg)
 {
 	int r = 0;
@@ -827,6 +932,9 @@ static long nfc_ioctl(struct file *pfile, unsigned int cmd, unsigned long arg)
 	case SET_RX_BLOCK:
 		break;
 	case SET_EMULATOR_TEST_POINT:
+		break;
+	case NFCC_INITIAL_CORE_RESET_NTF:
+		r = nfc_ioctl_core_reset_ntf(pfile, cmd, arg);
 		break;
 	default:
 		r = -ENOIOCTLCMD;
@@ -912,7 +1020,8 @@ err_presence_check:
 	return r;
 }
 /* Initialise qca199x_ NFC controller hardware */
-static int nfcc_initialise(struct i2c_client *client, unsigned short curr_addr)
+static int nfcc_initialise(struct i2c_client *client, unsigned short curr_addr,
+				struct qca199x_dev *qca199x_dev)
 {
 	int r = 0;
 	unsigned char raw_1p8_CONTROL_011[]	= {0x11, XTAL_CLOCK};
@@ -931,6 +1040,7 @@ static int nfcc_initialise(struct i2c_client *client, unsigned short curr_addr)
 	int ret = 0;
 
 	client->addr = curr_addr;
+	qca199x_dev->core_reset_ntf = DEFAULT_INITIAL_CORE_RESET_NTF;
 	r = i2c_master_send(client, &buf, 1);
 	if (r < 0)
 		goto err_init;
@@ -940,121 +1050,126 @@ static int nfcc_initialise(struct i2c_client *client, unsigned short curr_addr)
 	if (r < 0)
 		goto err_init;
 
-	if (0x10 != (0x10 & buf)) {
-		RAW(s73, 0x02);
+	RAW(s73, 0x02);
 
-		r = nfc_i2c_write(client, &raw_s73[0], sizeof(raw_s73));
-		if (r < 0)
-			goto err_init;
-
-		usleep(1000);
-		RAW(1p8_CONTROL_011, XTAL_CLOCK | 0x01);
-
-		r = nfc_i2c_write(client, &raw_1p8_CONTROL_011[0],
-						sizeof(raw_1p8_CONTROL_011));
-		if (r < 0)
-			goto err_init;
-
-		usleep(1000);
-		RAW(1P8_CONTROL_010, (0x8));
-		r = nfc_i2c_write(client, &raw_1P8_CONTROL_010[0],
-						sizeof(raw_1P8_CONTROL_010));
-		if (r < 0)
-			goto err_init;
-
-		usleep(10000);  /* 10ms wait */
-		RAW(1P8_CONTROL_010, (0xC));
-		r = nfc_i2c_write(client, &raw_1P8_CONTROL_010[0],
-					sizeof(raw_1P8_CONTROL_010));
-		if (r < 0)
-			goto err_init;
-
-		usleep(100);  /* 100uS wait */
-		RAW(1P8_X0_0B0, (FREQ_SEL_19));
-		r = nfc_i2c_write(client, &raw_1P8_X0_0B0[0],
-						sizeof(raw_1P8_X0_0B0));
-		if (r < 0)
-			goto err_init;
-
-		usleep(1000);
-
-		/* PWR_EN = 1 */
-		RAW(1P8_CONTROL_010, (0xd));
-		r = nfc_i2c_write(client, &raw_1P8_CONTROL_010[0],
-						sizeof(raw_1P8_CONTROL_010));
-		if (r < 0)
-			goto err_init;
-
-
-		usleep(20000);  /* 20ms wait */
-		/* LS_EN = 1 */
-		RAW(1P8_CONTROL_010, 0xF);
-		r = nfc_i2c_write(client, &raw_1P8_CONTROL_010[0],
-						sizeof(raw_1P8_CONTROL_010));
-		if (r < 0)
-			goto err_init;
-
-		usleep(20000);  /* 20ms wait */
-
-		/* Enable the PMIC clock */
-		RAW(1P8_PAD_CFG_CLK_REQ, (0x1));
-		r = nfc_i2c_write(client, &raw_1P8_PAD_CFG_CLK_REQ[0],
-					  sizeof(raw_1P8_PAD_CFG_CLK_REQ));
-		if (r < 0)
-			goto err_init;
-
-		usleep(1000);
-
-		RAW(1P8_PAD_CFG_PWR_REQ, (0x1));
-		r = nfc_i2c_write(client, &raw_1P8_PAD_CFG_PWR_REQ[0],
-					  sizeof(raw_1P8_PAD_CFG_PWR_REQ));
-		if (r < 0)
-			goto err_init;
-
-		usleep(1000);
-
-		RAW(slave2, 0x10);
-		r = nfc_i2c_write(client, &raw_slave2[0], sizeof(raw_slave2));
-		if (r < 0)
-			goto err_init;
-
-		usleep(1000);
-
-		RAW(slave1, NCI_I2C_SLAVE);
-		r = nfc_i2c_write(client, &raw_slave1[0], sizeof(raw_slave1));
-		if (r < 0)
-			goto err_init;
-
-		usleep(1000);
-
-		/* QCA199x NFCC CPU should now boot... */
-		r = i2c_master_recv(client, &raw_slave1_rd, 1);
-		/* Talk on NCI slave address NCI_I2C_SLAVE 0x2C*/
-		client->addr = NCI_I2C_SLAVE;
-
-		/*
-			Start with small delay and then we will poll until we
-			get a core reset notification - This is time for chip
-			& NFCC controller to come-up.
-		*/
-		usleep(1000); /* 1 ms */
-
-		do {
-			ret = i2c_master_recv(client, rsp, 5);
-			/* Found core reset notification */
-			if (((rsp[0] == CORE_RESET_RSP_GID) &&
-				(rsp[1] == CORE_RESET_OID) &&
-				(rsp[2] == CORE_RST_NTF_LENGTH))
-					|| time_taken == NTF_TIMEOUT) {
-				core_reset_completed = true;
-			}
-			usleep(10);  /* 10us sleep before retry */
-			time_taken++;
-		} while (!core_reset_completed);
-		r = 0;
-	} else {
+	r = nfc_i2c_write(client, &raw_s73[0], sizeof(raw_s73));
+	if (r < 0)
 		goto err_init;
-	}
+
+	usleep(1000);
+	RAW(1p8_CONTROL_011, XTAL_CLOCK | 0x01);
+
+	r = nfc_i2c_write(client, &raw_1p8_CONTROL_011[0],
+					sizeof(raw_1p8_CONTROL_011));
+	if (r < 0)
+		goto err_init;
+
+	usleep(1000);
+	RAW(1P8_CONTROL_010, (0x8));
+	r = nfc_i2c_write(client, &raw_1P8_CONTROL_010[0],
+					sizeof(raw_1P8_CONTROL_010));
+	if (r < 0)
+		goto err_init;
+
+	usleep(10000);  /* 10ms wait */
+	RAW(1P8_CONTROL_010, (0xC));
+	r = nfc_i2c_write(client, &raw_1P8_CONTROL_010[0],
+				sizeof(raw_1P8_CONTROL_010));
+	if (r < 0)
+		goto err_init;
+
+	usleep(100);  /* 100uS wait */
+	RAW(1P8_X0_0B0, (FREQ_SEL_19));
+	r = nfc_i2c_write(client, &raw_1P8_X0_0B0[0],
+					sizeof(raw_1P8_X0_0B0));
+	if (r < 0)
+		goto err_init;
+
+	usleep(1000);
+
+	/* PWR_EN = 1 */
+	RAW(1P8_CONTROL_010, (0xd));
+	r = nfc_i2c_write(client, &raw_1P8_CONTROL_010[0],
+					sizeof(raw_1P8_CONTROL_010));
+	if (r < 0)
+		goto err_init;
+
+
+	usleep(20000);  /* 20ms wait */
+	/* LS_EN = 1 */
+	RAW(1P8_CONTROL_010, 0xF);
+	r = nfc_i2c_write(client, &raw_1P8_CONTROL_010[0],
+					sizeof(raw_1P8_CONTROL_010));
+	if (r < 0)
+		goto err_init;
+
+	usleep(20000);  /* 20ms wait */
+
+	/* Enable the PMIC clock */
+	RAW(1P8_PAD_CFG_CLK_REQ, (0x1));
+	r = nfc_i2c_write(client, &raw_1P8_PAD_CFG_CLK_REQ[0],
+				  sizeof(raw_1P8_PAD_CFG_CLK_REQ));
+	if (r < 0)
+		goto err_init;
+
+	usleep(1000);
+
+	RAW(1P8_PAD_CFG_PWR_REQ, (0x1));
+	r = nfc_i2c_write(client, &raw_1P8_PAD_CFG_PWR_REQ[0],
+				  sizeof(raw_1P8_PAD_CFG_PWR_REQ));
+	if (r < 0)
+		goto err_init;
+
+	usleep(1000);
+
+	RAW(slave2, 0x10);
+	r = nfc_i2c_write(client, &raw_slave2[0], sizeof(raw_slave2));
+	if (r < 0)
+		goto err_init;
+
+	usleep(1000);
+
+	RAW(slave1, NCI_I2C_SLAVE);
+	r = nfc_i2c_write(client, &raw_slave1[0], sizeof(raw_slave1));
+	if (r < 0)
+		goto err_init;
+
+	usleep(1000);
+
+	/* QCA199x NFCC CPU should now boot... */
+	r = i2c_master_recv(client, &raw_slave1_rd, 1);
+	/* Talk on NCI slave address NCI_I2C_SLAVE 0x2C*/
+	client->addr = NCI_I2C_SLAVE;
+
+	/*
+	 * Start with small delay and then we will poll until we
+	 * get a core reset notification - This is time for chip
+	 * & NFCC controller to come-up.
+	 */
+	usleep(15000); /* 15 ms */
+
+	do {
+		ret = i2c_master_recv(client, rsp, 5);
+		/* Found core reset notification */
+		if (((rsp[0] == CORE_RESET_RSP_GID) &&
+			(rsp[1] == CORE_RESET_OID) &&
+			(rsp[2] == CORE_RST_NTF_LENGTH))
+				|| time_taken == NTF_TIMEOUT) {
+			dev_dbg(&client->dev,
+				"NFC core reset recevd: %s: info: %p\n",
+				__func__, client);
+			core_reset_completed = true;
+		} else {
+		  usleep(2000);  /* 2ms sleep before retry */
+		}
+		time_taken++;
+	} while (!core_reset_completed);
+	if (time_taken == NTF_TIMEOUT)
+		qca199x_dev->core_reset_ntf = TIMEDOUT_INITIAL_CORE_RESET_NTF;
+	else
+		qca199x_dev->core_reset_ntf = ARRIVED_INITIAL_CORE_RESET_NTF;
+
+	r = 0;
 	return r;
 err_init:
 	r = 1;
@@ -1154,6 +1269,7 @@ static int nfc_parse_dt(struct device *dev, struct qca199x_platform_data *pdata)
 	pdata->dis_gpio = of_get_named_gpio(np, "qcom,dis-gpio", 0);
 	if ((!gpio_is_valid(pdata->dis_gpio)))
 		return -EINVAL;
+	disable_ctrl = pdata->dis_gpio;
 
 	pdata->irq_gpio = of_get_named_gpio(np, "qcom,irq-gpio", 0);
 	if ((!gpio_is_valid(pdata->irq_gpio)))
@@ -1406,23 +1522,12 @@ static int qca199x_probe(struct i2c_client *client,
 		gpio_set_value(platform_data->dis_gpio, 1);
 		goto err_nfcc_not_present;
 	}
-	regulators.regulator = regulator_get(&client->dev, regulators.name);
-	if (IS_ERR(regulators.regulator)) {
-		r = PTR_ERR(regulators.regulator);
-		pr_err("regulator get of %s failed (%d)\n", regulators.name, r);
-	} else {
-		/* Enable the regulator */
-		r = regulator_enable(regulators.regulator);
-		if (r) {
-			pr_err("vreg %s enable failed (%d)\n",
-				regulators.name, r);
-		}
-	}
 
 	logging_level = 0;
-	/* request irq.  The irq is set whenever the chip has data available
-	* for reading.  It is cleared when all data has been read.
-	*/
+	/*
+	 * request irq.  The irq is set whenever the chip has data available
+	 * for reading.  It is cleared when all data has been read.
+	 */
 	device_mode.handle_flavour = UNSOLICITED_MODE;
 	/* NFC_INT IRQ */
 	qca199x_dev->irq_enabled = true;
@@ -1460,6 +1565,10 @@ static int qca199x_probe(struct i2c_client *client,
 	}
 	i2c_set_clientdata(client, qca199x_dev);
 	gpio_set_value(platform_data->dis_gpio, 1);
+
+	/* To keep track if region2 command has been sent to controller */
+	region2_sent = false;
+
 	dev_dbg(&client->dev,
 	"nfc-nci probe: %s, probing qca1990 exited successfully\n",
 		 __func__);
@@ -1534,17 +1643,52 @@ static struct i2c_driver qca199x = {
 	},
 };
 
+
+static int nfcc_reboot(struct notifier_block *notifier, unsigned long val,
+		      void *v)
+{
+	/*
+	 * Set DISABLE=1 *ONLY* if the NFC service has been disabled.
+	 * This will put NFCC into HPD(Hard Power Down) state for power
+	 * saving when powering down(Low Batt. or Power off handset)
+	 * If user requires NFC and CE mode when powered down(PD) the
+	 * middleware puts NFCC into region2 prior to PD. In this case
+	 * we DO NOT HPD chip as this will trash Region2 and CE support
+	 * when handset is PD.
+	 */
+	if (region2_sent == false) {
+		/* HPD the NFCC */
+		gpio_set_value(disable_ctrl, 1);
+	}
+	return NOTIFY_OK;
+}
+
+
+static struct notifier_block nfcc_notifier = {
+	.notifier_call	= nfcc_reboot,
+	.next		= NULL,
+	.priority	= 0
+};
+
 /*
  * module load/unload record keeping
  */
 static int __init qca199x_dev_init(void)
 {
+	int ret;
+
+	ret = register_reboot_notifier(&nfcc_notifier);
+	if (ret) {
+		pr_err("cannot register reboot notifier (err=%d)\n", ret);
+		return ret;
+	}
 	return i2c_add_driver(&qca199x);
 }
 module_init(qca199x_dev_init);
 
 static void __exit qca199x_dev_exit(void)
 {
+	unregister_reboot_notifier(&nfcc_notifier);
 	i2c_del_driver(&qca199x);
 }
 module_exit(qca199x_dev_exit);
